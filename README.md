@@ -12,7 +12,7 @@ background spectrum measured previously), optional line removal/reduction, optio
 smoothing of the spectrum acquired by low order polynomial fits over several adjacent
 points. Choice of averaging method.
 
-Tested on Ubuntu16.04, `8.04 and MacOS. User should have installed: python 2.7, 
+Tested on Ubuntu 16.04, 18.04 and MacOS. User should have installed: python 2.7, 
 gnuradio, astropy, uhd, astropy, matplotlib==2.02 .
 
 Credits: 
