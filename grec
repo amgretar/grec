@@ -1,0 +1,345 @@
+#!/usr/bin/env python2
+
+# Implements a "spectrometer" using a Sofware Defined Receiver (SDR). It can receive
+# from any receiver supported by gnuradio via the --args argument although support for
+# rtl, airspy, uhd, & funcube receivers is slightly more streamlined. The program spectrum_log.py 
+# is the front end to the actual data acquisition program spectrum.py. The program has as
+# a companion program, showdata.py which is made to display the data format (text array)
+# used to store the acquired spectra. 
+# 
+# Features: optional background subtraction (using a 
+# background spectrum measured previously), optional line removal/reduction, optional 
+# smoothing of the spectrum acquired by low order polynomial fits over several adjacent
+# points. Choice of averaging method.
+#
+# todo: 
+# - test integration with Vigilants
+#
+# Credits: 
+# - Initial version (data acquisiion, spectrum generation, zmq-based data handling, and 
+# file output, etc.) written by Danny Jacobs and his students at ASU. Summer/Fall 2018.
+# - Additional features (command-line interface, improved plotting, additional receiver types, 
+# background subtraction, data conditioning) added by Andri Gretarsson. Fall/Winter 2018.
+
+from __future__ import print_function
+import sys
+import numpy as np
+import matplotlib                 # Uncomment for remote (teamviewer etc.) use on linux
+matplotlib.use('QT4Agg')          # (and this line)
+import matplotlib.pyplot as plt
+import matplotlib.style as plotstyle
+from spectrum import spectrum,zmq_min_max_avg
+from astropy.time import Time
+import os
+from scipy.interpolate import InterpolatedUnivariateSpline as interp1
+from scipy.signal import savgol_filter
+import argparse
+import time
+
+# LOCAL FUNCTIONS
+def round_to_nearest_2(x):
+    return 2**(x-1).bit_length()
+
+def dB(x):
+    return 10*np.log10(x)
+
+# ----------------------------------------------------------------------------------------------
+# USER ADJUSTABLE PARAMETERS
+freq = 102
+upconv = 0                  # amount by which frequencies are upcoverted before the receiver
+filestring = 'test'         # add this name to the filename string to help identify it
+receiver_type = 'osmo'      # rtl, airspy, uhd, osmo, funcube. Use "uhd" if bandpass bandwidth must be set, such as for B200. Can also use rtl, uhd, airspy etc to differentiate between multiple dissimilar receivers connected to a single machine
+datadir = 'data/'           # directory into which to write the data 
+SDR_BW = 2.5                # sample rate of the receiver
+gain = 50
+FFT_size = 4096             # Number of bins in the FFT
+duration = 15               # duration of measurement in seconds
+dtsave = 10                 # interval between data saves
+do = 'plot'                 # both save and plot the spectrum
+avgtime = 0.1               # averaging time in exponential average
+avgtype = 'lin'             # type of average to do: 'geom'(etric) or 'lin'(ear)
+kp = False                  # keep plot open at the end of the acquisition (keeps python running)
+trimfrac = 0.00             # trim this from _each_ end of the array
+spts = 1                    # number of FFT points over which to smooth (Savitsky-Golay)
+sval = 2                    # line removal aggressiveness. Also see description in help.
+# Bandpass correction: "bp_file". This is essentially just a spectrum taken without the antenna attached. It can also 
+# be a simple single column vector of the spectrum values (convenient for manually modified bandpass correction spectra). 
+# If the specified the band-pass file is not found or is not in a correct format, no correction is made.
+bp_file = 'none'            # default file is for an rtlsdr v1 with a yellow/orange circuit board
+bp_bw = SDR_BW              # freqeuncy range of the bandpass data in bp_file
+extraargs = ''              # additional arguments to send to the receiver
+ymin = -20                  # minimum y-axis value (dB)
+ymax = 50                   # maximum y-axis value (dB)
+portnum = 5555              # communication with receiver. Use different ports for multiple receivers on the same machine.
+figtitle = 'Spectrum'       # default figure title
+nreads = 75                 # number of raw spectra to averge before sending to the zmq push sink (port)
+
+CSI = '\x1B['               # Used to make terminal text to colored. See Wikipedia, "ANSI escape codes" (ex: print(CSI+'94m'+'Andri'+CSI +'0m') )
+# ----------------------------------------------------------------------------------------------------------------
+# PARSE PARAMETERS PASSED FROM THE COMMAND LINE
+parser = argparse.ArgumentParser(description='Acquire spectra from an SDR. Example: spectrum_log.py -f 102 -r 2.5')
+parser.add_argument('-f','--frequency',help='Center frequency (in MHz) to which to tune. Default: 102.1 ',type=float)
+parser.add_argument('-r','--samplerate',help='Number of I,Q demod pairs to be acquired per second (in millions). Default: 3.2',type=float)
+parser.add_argument('-g','--gain',help='LNA gain (0-50 dB)',type=float)
+parser.add_argument('-o','--outdir',help='Path to directory for holding output data file. Default: ''./data/''',type=str)
+parser.add_argument('-s','--filestring',help='String to add to the output data file name',type=str)
+parser.add_argument('-fn','--filename',help='Give an explicit file name for the output data. Default: none', type=str)
+parser.add_argument('-d','--duration',help='Duration of acquisition in seconds. Default: 60.',type=float)
+parser.add_argument('-t','--receiver',help='Receiver type string: ''rtlsdr'', ''airspy'', ''uhd'', ''osmo''. Default: osmo',type=str)
+parser.add_argument('-n','--nfft',help='Number of bins in the fft. Default: 4096',type=int)
+parser.add_argument('-b','--bpfile',help='Path the the file containing spectrum without antenna attached. Default: bp.txt',type=str)
+parser.add_argument('-wb','--bpbw',help='Sample rate (bandwidth) of the bandpass file. Default: equal to samplerate',type=float)
+parser.add_argument('-ymin','--ymin',help='Lower range of plot (dB)',type=float)
+parser.add_argument('-ymax','--ymax',help='Upper range of plot (dB)',type=float)
+parser.add_argument('-tc','--avgtime',help='Averaging time constant (sec)',type=float)
+parser.add_argument('-av','--avgtype',help='Type of average ''geom''(etric) or ''lin''(ear)',type=str)
+parser.add_argument('-dts','--dtsave',help='Time between saves of the spectrum',type=float)
+parser.add_argument('-do','--do',help='What the code should output: ''save'', ''plot'', or ''both''',type=str)
+parser.add_argument('-kp','--kp',help='''True'' to keep plot (and python) open at the end of acquisition. Default: ''False''',type=str)
+parser.add_argument('-tf','--trimfrac',help='Fraction of frequencies to trim from each end. Default: 0.05',type=float)
+parser.add_argument('-ft','--figtitle',help='Figure title',type=str)
+parser.add_argument('-N','--nreads',help='Number of arithmetic averages to do before sending data to the logger for exponential averaging. Default: 300',type=int)
+parser.add_argument('-sp','--spts',help='Number of points over which to Savitzky-Golay filter (smooth) the data. Negative values adds a line removal step. 1 = Do nothing, 0 = line removal only. Default: 1',type=int)
+parser.add_argument('-sv','--sval',help='Remove points that differ from the adjacent point by more than sval*median(diff(data)). Default: sval=2',type=float)
+parser.add_argument('-wh','--whiten', help='Use with hydrogen observations to whiten the background',action='store_true')
+parser.add_argument('-lo','--upconv',help='Upconverter local oscillator frequency (MHz)',type=float)
+parser.add_argument('-pn','--portnum',help='Port number for communication. Default: 5555)',type=int)
+parser.add_argument('-a','--args',help='Additional arguments to send to receiver, e.g. subdev=B:0 or bias=1',type=str)
+parser.add_argument('--version',action='version',version='spectrum_log 1.0')
+args = parser.parse_args()
+
+if args.frequency is not None: freq = args.frequency
+if args.samplerate is not None: SDR_BW = args.samplerate
+if args.gain is not None: gain = args.gain
+if args.outdir is not None: datadir = args.outdir
+if args.filestring is not None: filestring = args.filestring
+if args.duration is not None: duration = args.duration
+if args.receiver is not None: receiver_type = args.receiver
+if args.nfft is not None: FFT_size = args.nfft
+if args.bpfile is not None: bp_file = args.bpfile
+if args.bpbw is not None: bp_bw = args.bpbw
+if args.ymin is not None: ymin = args.ymin
+if args.ymax is not None: ymax = args.ymax
+if args.avgtime is not None: avgtime = args.avgtime
+if args.avgtype is not None: avgtype = args.avgtype
+if args.dtsave is not None: dtsave = args.dtsave
+if args.do is not None: do = args.do
+if args.kp is not None: kp = args.kp
+if args.figtitle is not None: figtitle = args.figtitle
+if args.trimfrac is not None: trimfrac = args.trimfrac
+if args.nreads is not None: nreads = args.nreads
+if args.spts is not None: spts = args.spts
+if args.sval is not None: sval = args.sval
+if args.upconv is not None: upconv = args.upconv
+if args.portnum is not None: portnum = args.portnum
+if args.args is not None: extraargs = ',' + args.args
+
+freq = freq*1e6                                                 # all rates and frequencies are specified in MHz
+SDR_BW = SDR_BW*1e6                                             # 
+bp_bw = bp_bw*1e6                                               #
+upconv = upconv*1e6                                             #
+freq = freq + upconv                                            # tune higher by the upconversion frequency
+
+doplot = False
+savedata = False
+if do=='plot' or do=='both': doplot = True                      # controls whether a plot is displayed
+if do=='save' or do=='both': savedata = True                    # controls whether any data is saved
+
+FFT_size = round_to_nearest_2(FFT_size)                         # forces FFT length to be a factor of 2 for speed
+print(CSI+'94m'+"FFT_size = "+str(FFT_size)+CSI +'0m')
+freqs = (np.arange(FFT_size)-FFT_size/2)*SDR_BW/FFT_size + freq - upconv# generate frequency vector from center frequency, acq. rate, and FFT size
+print(CSI+'91m'+"freq range = " + str(freqs.min()/1e6)+','+str(freqs.max()/1e6)+CSI +'0m')
+
+nstart = int(np.floor(trimfrac*np.shape(freqs)[0]))
+nend = int(np.ceil((1-trimfrac)*np.shape(freqs)[0]))
+freqs_c = freqs[nstart:nend]  
+
+# start a data file
+if savedata:
+    timestamp=Time.now().isot.replace(':','_')
+    if args.filename is not None:
+        filename = args.filename
+    else:
+        filename = "{n}_{nbins}_{d}.txt".format(n=filestring,nbins=FFT_size,d=timestamp)
+    f = open(os.path.join(datadir,filename),'w>',buffering=0)               # write the header
+    f.write("# Spectrum data file\n")
+    f.write("# Start Date: {d}\n".format(d=timestamp))
+    f.write('# freqs: {freqs_c}\n'.format(freqs_c=','.join(freqs_c.astype(str))))
+    f.write("# time (julian date), power in dB in each frequency bin\n")
+    print("logging to: {filename}".format(filename=filename))
+else:
+    print("WARNING: data logging disabled")
+
+def main(top_block_cls=spectrum,options=None):
+    tb = top_block_cls(freq,FFT_size,SDR_BW,receiver_type,gain,portnum,extraargs)
+    socket_str = tb.get_data_address()                          # data are streaming from this ZMQ push sink
+    tb.set_tuning(freq)
+    tb.set_gain(gain)  
+
+    # load bandpass data
+    try:
+        try:                                                    # this section applies when bp_file contains a single column-vector or row-vector (text)
+            bpdata = np.loadtxt(bp_file)                        # assumed to be uniformly spaced in frequency
+            bpr = 10**(bpdata/10)
+            f_bp = np.linspace(freq-bp_bw/2,freq+bp_bw/2,np.shape(bpr)[0])
+            bandpass = interp1(f_bp,bpr,k=3)(freqs)
+            yesbp = True
+            # plt.plot(freqs, bandpass)
+            # plt.show()            
+        except:                                                 # this section applies to data files of the type output by this program
+            bpdata = np.loadtxt(bp_file,  delimiter=',', skiprows=4) 
+            bpdata = bpdata[:,1:]                               # first column is the julian date; remove
+            bpr = np.mean(10**(bpdata/10),0)                    # average the rows in case there were many spectra written
+            dif = np.concatenate(([0],np.diff(bpr)))            # look for spurious lines from the receiver
+            f_bp = np.linspace(freq-bp_bw/2,freq+bp_bw/2,np.shape(bpr)[0])
+            mask = np.abs(dif)<3*np.median(np.abs(dif))         # construct a mask for data that does not vary too much from the spectrum
+            f_bp = f_bp[mask]                                   # select only the well behaved data point frequencies
+            bpr = bpr[mask]                                     # select only the well behaved data points
+            bpr= savgol_filter(bpr, int(np.floor(FFT_size/100)*2+1), 3) # smooth the bandpass data
+            bandpass = interp1(f_bp, bpr,k=3)(freqs)            # make the bandpass spectrum with the correct frequencies
+            yesbp = True
+            # plt.plot(freqs, bandpass)
+            # plt.show()
+    except:
+        yesbp = False
+
+    # set up plot: interactive figure with nice aethetics. After this, data just gets replaced.
+    if doplot:
+        plt.ion()
+        plotstyle.use('dark_background')
+        fig = plt.figure(figsize=(12,12/1.618))              
+        ax = fig.add_subplot(111)
+        y =np.linspace(ymin,ymax,np.shape(freqs_c)[0])   # fill the axes with a line from corner to corner to establish the plot canvas
+        p,=ax.plot(freqs_c/1e6,y,c='k',alpha=0.6,linewidth=0.5)
+        plt.xlabel('freq [MHz]')
+        plt.ylabel('dB')
+        plt.title(figtitle)
+        plt.pause(0.001)
+        plt.grid()
+        p.set_color([0.9,0.9,1.0])
+        fig.set_facecolor
+        ax.grid(which='both',color=[0.3,0.5,0.1], linestyle='-', linewidth=0.5,alpha=0.5)
+        ax.set_facecolor([0,0.07,0.03])
+        spinecolor = [0.6,0.6,0.6]
+        ax.spines['bottom'].set_color(spinecolor)
+        ax.spines['top'].set_color(spinecolor)
+        ax.spines['right'].set_color(spinecolor)
+        ax.spines['left'].set_color(spinecolor)
+        ax.tick_params(axis='x', colors=spinecolor)
+        ax.tick_params(axis='y', colors=spinecolor)
+        ax.xaxis.label.set_color(spinecolor)
+        ax.yaxis.label.set_color(spinecolor)
+        ax.title.set_color(spinecolor)
+    
+    i=0
+    tstart = Time.now()
+    t = tstart
+    tsaved = tstart
+    tb.start()
+    while duration > (Time.now()-tstart).sec:
+        try:
+            dt = Time.now().utc - t                             # time since last acquisision
+            t = Time.now().utc                                  # time of this acquisition
+            navg = np.round(np.max([avgtime/dt.sec,1]))         # at least 1 spectrum per average            # number of spectra, navg, in one averaging time, avgtime
+            cnt = np.min([navg,i+1])                            # partial average converges faster if we use cnt instead of navg
+            alpha = 1 - np.exp(-1/cnt)                          # smoothing factor "alpha" used below
+            #tb.start()                                         # gnuradio magic (activates the code in spectrum.py?)
+            
+            # Get data
+            mean_accum = zmq_min_max_avg(socket_str,FFT_size,nreads=nreads) # data should be NchanxNtimes long where Ntimes floats around but is generally 2-6
+            print('.',end='')                
+           
+            # Divide by the no-antenna (noise) spectrum and trim band edges
+            if yesbp:                                           # divide by spectrum without antenna attached (removes bandpass filter shape)
+                mean_accum = mean_accum/bandpass                # signal is now in units of receiver noise floor
+            ylin = mean_accum[nstart:nend]
+
+            # Smoothing (spts<0: line removal and smoothing (spts=-1 or 0: only line removal), spts>0: savgol_filter smoothing (spts = 1: do nothing)
+            polyorder = 1                                       # Order 1 (linear) doesn't lead to cusps or NaNs
+            if spts <= 0:
+                f_y = freqs_c
+                dif1 = np.concatenate(([0],np.diff(ylin)))       # will look for adjacent points unusually far apart in power
+                dif2 = np.concatenate((np.diff(ylin),[0]))       # these two vectors will allow us to remove both of the points efficiently
+                mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
+                mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+                mask = mask1 & mask2                                  # by 
+                f_y = f_y[mask]                                 # select only the well behaved data point frequencies
+                ys = ylin[mask]                                 # select only the well behaved data points
+                ylin = interp1(f_y, ys,k=1)(freqs_c)            # remake the spectrum with the correct frequencies
+            if np.abs(spts) > polyorder:                        # Smoothing (poly-fitting) needs at least 1 more data point than fit coeffs to actually be smoothing
+                # number points over which to smooth must be odd. Hence the 1+2*int(.../2) business
+                ylin = savgol_filter(ylin, \
+                    1+2*int(np.min([np.abs(spts),np.shape(freqs_c)[0]/10])/2),polyorder) # smooth over no more than 1/10 the data at a time                
+            # Whiten the background for hydrogen observations (better to do this in "showdata.py" if data is being saved)
+            if args.whiten:
+                mask = ~((freqs_c > 1419.7*1e6) & (freqs_c < 1420.9*1e6))
+                norder = 10
+                fr = freqs_c/1e6 - np.median(freqs_c/1e6)
+                c = np.polyfit(fr[mask],ylin[mask],norder)
+                bkgr = np.polyval(c,fr)
+                ylin=ylin/bkgr
+
+            # Average
+            if i == 0:                                          # start running averages with a single spectrum
+                if avgtype == 'geom':
+                    print('Using exponentially weighted geometric  averaging')
+                    sdB = dB(ylin)
+                elif avgtype == 'lin':
+                    print('Using exponentially weighted arithmetic averaging')
+                    slin = ylin
+                elif avgtype == 'median':
+                    print('Using median averaging')
+                    ymat = np.array([ylin])
+                    slin = ylin
+                else:
+                    print('Using unweighted arithmetic averaging')
+                    slin = ylin
+            else:
+                if avgtype == 'geom':
+                    sdB = alpha*dB(ylin) + (1-alpha)*sdB        # exponentially weighted _geometric_ mean (mean dB's per Hz)
+                elif avgtype == 'lin':
+                    slin = alpha*ylin + (1-alpha)*slin          # exponentially weighted _arithmetic_ mean (mean power per Hz) 
+                elif avgtype == 'median':                       # median averaging (good for intermittent noise but a bit memory hungry)
+                    if i >= navg:
+                        ymat = ymat[1:,:]                       # if matrix has reached navg rows. cut off first row before appending another
+                    ymat = np.append(ymat,np.array([ylin]),axis=0) # one spectrum per row in the matrix
+                    slin = np.median(ymat,axis=0)               # median is taken column by column
+                else:                                           # running arithmetic average
+                    slin = slin + (ylin-slin)/cnt               # add an nth of the latest sample and subtract an nth of the mean
+                
+            # Write
+            if (Time.now()-tsaved).sec >= dtsave and savedata:  # writes a .csv file with time in the first column, spectrum values in subsequent ones
+                f.write(str(t.jd)+', ')
+                if avgtype=='geom':
+                    f.write(','.join(sdB.astype(str)))
+                else:
+                    f.write(','.join(dB(slin).astype(str)))                   
+                f.write('\n')
+                tsaved = Time.now()
+                print('s',end='')
+
+            # Plot
+            if doplot:
+                if avgtype=='geom':
+                    p.set_ydata(sdB)
+                else:
+                    sdB = dB(slin)
+                    p.set_ydata(sdB)         
+                fig.canvas.draw()
+                plt.pause(0.001)
+                
+            
+            i += 1
+            sys.stdout.flush()
+        except(KeyboardInterrupt):
+            sys.exit()
+            
+        #tb.stop()                                                           # gnuradio magic (top_block is part of spectrum.py)
+        #tb.wait()                       
+    tb.stop()
+    tb.wait()
+    print('\n')
+    if kp: plt.show(block=True)
+
+if __name__ == '__main__':
+    main()

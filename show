@@ -1,0 +1,266 @@
+#!/usr/bin/env python2
+
+import numpy as np
+#import matplotlib                 # Uncomment for use with a different backend
+#matplotlib.use('MacOSX')          # (and this line specifies the backend)
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.cm as cm
+import matplotlib.style as plotstyle
+import argparse
+import os
+from astropy.time import Time
+from matplotlib.widgets import Slider
+from mpl_toolkits import mplot3d
+from scipy.interpolate import InterpolatedUnivariateSpline as interp1
+from scipy.signal import savgol_filter
+import argparse
+
+slider = False
+colmap = 'cividis'
+upconv = 0
+timetype = 'hrs'
+spts = 1                    # number of FFT points over which to smooth (Savitsky-Golay)
+sval = 2                    # line removal aggressiveness. Also see description in help.
+
+pcolorplot = True
+parser = argparse.ArgumentParser()
+parser.add_argument('-f','--fref',help='Frequency to use as a reference for gain drift correction (MHz)',type=float)
+parser.add_argument('-wh','--whiten',help='Attempt to whiten the background in the presence of hydrogen',action='store_true')
+parser.add_argument('-cm','--colmap',help='Any of the colormaps defimed inm matplotlib.cm',type=str)
+parser.add_argument('-sl','--slider',help='Display single spectrum at a time. Use slider to select time.',action='store_true')
+parser.add_argument('-lo','--upconv',help='Upconverter local oscillator frequency (MHz)',type=float)
+parser.add_argument('-tt','--timetype',help='Set format for the time axis: ''days'',''hrs''. Default is ''hrs''',type=str)
+parser.add_argument('-wo','--writeout',help='Write the processed image to a text file as an array',action='store_true')
+parser.add_argument('-sp','--spts',help='Number of points over which to Savitzky-Golay filter (smooth) the data. Negative values adds a line removal step. 1 = Do nothing, 0 = line removal only. Default: 1',type=int)
+parser.add_argument('-sv','--sval',help='Remove points that differ from the adjacent point by more than sval*median(diff(data)). Default: sval=2',type=float)
+parser.add_argument('inputfile',help='Path the the data file to plot. Default: data.txt',type=str)
+args = parser.parse_args()
+
+if args.fref != None: fref = args.fref
+if args.colmap != None: colmap = args.colmap
+if args.inputfile != None: inputfile = args.inputfile
+if args.upconv != None: upconv = args.upconv
+if args.timetype != None: timetype = args.timetype
+if args.spts is not None: spts = args.spts
+if args.sval is not None: sval = args.sval
+
+def makeplot(filename,pcolorplot):
+    # read the frequencies and parse them into freqs
+    print('Reading the data')
+    with open(filename) as f:
+        f.readline()
+        f.readline()
+        freqline = f.readline()
+        freqline = freqline[8:]
+        freqs=np.array(map(float, freqline.split(',')))
+
+    freqs = freqs - upconv*1e6              # correct for upconversion (if present)
+
+    # read the data
+    data = np.loadtxt(filename,  delimiter=',', skiprows=4) 
+
+    # read the time (first column of data is the julian date)
+    t = Time(data[:,0],format='jd')
+    data = data[:,1:]
+    
+    # correct for gain drift
+    if args.fref != None: 
+        print('Correcting gain drift')
+        fref_index = (np.abs(freqs - fref*1e6)).argmin()
+        dref = data[0,fref_index]
+        for s in range(0,np.shape(t)[0]):
+            data[s,:]=data[s,:]+dref-np.mean(data[s,fref_index-5:fref_index+5])
+
+    # CONVERT THIS BACK TO LINEAR DOMIAN        
+    # Smoothing (spts<0: line removal and smoothing (spts=-1 or 0: only line removal), spts>0: savgol_filter smoothing (spts = 1: do nothing)
+    polyorder = 1                                       # Order 1 (linear) doesn't lead to cusps or NaNs
+    if args.spts is not None:
+        for s in range(0,np.shape(t)[0]):
+            ylin = 10**(data[s,:]/10)
+            if spts <= 0:
+                dif1 = np.concatenate(([0],np.diff(ylin)))       # will look for adjacent points unusually far apart in power
+                dif2 = np.concatenate((np.diff(ylin),[0]))       # these two vectors will allow us to remove both of the points efficiently
+                mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for dfata that does not vary too much from the spectrum
+                mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+                mask = mask1 & mask2                                  # by 
+                ylin = interp1(freqs[mask], ylin[mask],k=1)(freqs)            # remake the spectrum with the correct frequencies
+            if np.abs(spts) > polyorder:                        # Smoothing (poly-fitting) needs at least 1 more data point than fit coeffs to actually be smoothing
+                # number points over which to smooth must be odd. Hence the 1+2*int(.../2) business
+                data[s,:] = 10*np.log10(savgol_filter(ylin, \
+                    1+2*int(np.min([np.abs(spts),np.shape(freqs)[0]/10])/2),polyorder)) # smooth over no more than 1/10 the data at a time                
+
+    # whiten
+    if args.whiten:
+        print('Whitening background (omitting H1 line)')
+        mask = ~((freqs > 1419.7*1e6) & (freqs < 1420.9*1e6))
+        for s in range(0,np.shape(t)[0]):
+            d = data[s,:]
+            norder = 15
+            fr = freqs/1e6 - np.median(freqs/1e6)
+            c = np.polyfit(fr[mask],d[mask],norder)
+            bkgr = np.polyval(c,fr)
+            data[s,:]=data[s,:]-bkgr
+
+    # write the processed image to a file (as a text array)
+    if args.writeout:
+        print('Saving processed image data')
+        np.savetxt(inputfile.split('.')[:-1][0]+'_img.txt',data)                        
+
+    # Show the (possibly whitened/processed) data
+    plt.ion()
+    print('Displaying plot')
+    plotstyle.use('dark_background')
+    fig = plt.figure(figsize=(12,12/1.618))
+    if args.slider: 
+        # spectra selected by interactive slider
+        ax = fig.add_subplot(111)
+        p,=ax.plot(freqs/1e6,data[0,:],c='k',alpha=0.6,linewidth=0.5)
+        plt.xlabel('freq [MHz]')
+        plt.ylabel('dB')
+        plt.title('Spectrum')
+        plt.pause(0.001)
+        plt.grid()
+        p.set_color([0.9,0.9,1.0])
+        fig.set_facecolor
+        ax.grid(which='both',color=[0.3,0.5,0.1], linestyle='-', linewidth=0.5,alpha=0.5)
+        ax.set_facecolor([0,0.07,0.03])
+        spinecolor = [0.6,0.6,0.6]
+        ax.spines['bottom'].set_color(spinecolor)
+        ax.spines['top'].set_color(spinecolor)
+        ax.spines['right'].set_color(spinecolor)
+        ax.spines['left'].set_color(spinecolor)
+        ax.tick_params(axis='x', colors=spinecolor)
+        ax.tick_params(axis='y', colors=spinecolor)
+        ax.xaxis.label.set_color(spinecolor)
+        ax.yaxis.label.set_color(spinecolor)
+        ax.title.set_color(spinecolor)
+        ymin = np.min(data)
+        ymax = np.max(data)
+        ax.set_ylim([np.min(data)-(ymax-ymin)/10,np.max(data)+(ymax-ymin)/10])
+        sliderfgcolor = [0.48,0.45,0.45]
+        slider_ax = plt.axes([0.16,0.02,0.675,0.015], facecolor='black') # time selector slider axes
+        thrs = (t-t[0]).jd*24
+        dt = thrs[-1]/np.shape(data)[0] # time in hours between data spectra
+
+        tslider = Slider(slider_ax, 'hrs', thrs[0], thrs[-1], valinit=dt*np.round(np.shape(data)[0]/2),color=sliderfgcolor)    
+        def update_time_value(placeholderval):          # Find the spectrum to display from the slider position
+            idx = (np.abs(thrs-tslider.val)).argmin()   # gives the index of the spectrum closest in time to the slider time
+            p.set_ydata(data[idx,:])                    # updates the plot with that spectrum
+        
+        def arrow_key_control(event):                   # Change the slider position using the arrow keys
+            if event.key == '-' or event.key == 'left': # left arrow was pressed
+                if tslider.val > thrs[0]:               # if not at min time range 
+                    tslider.set_val(tslider.val-dt)     # reduce the time by the time interval between saved spectra
+            elif event.key == '='or event.key == 'right':
+                if tslider.val < thrs[-1]:
+                    tslider.set_val(tslider.val+dt)     # tslider.set_val() is apparently not a documented feature of matplotlib (so may disappear)
+            elif event.key == 'shift+-'or event.key == 'shift+left':
+                if tslider.val < thrs[-1]:
+                    tslider.set_val(tslider.val-3*dt)            
+            elif event.key == 'shift+='or event.key == 'shift+right':
+                if tslider.val < thrs[-1]:
+                    tslider.set_val(tslider.val+3*dt)
+        fig.canvas.mpl_connect('key_press_event', arrow_key_control)
+        tslider.on_changed(update_time_value)
+
+    else:
+        # pcolor style plot
+        ax = fig.add_subplot(111)
+        if timetype == 'days':
+            extent = [freqs[0]/1e6, freqs[-1]/1e6, 0, (t[-1]-t[0]).jd]            # Smoothing (spts<0: line removal and smoothing (spts=-1 or 0: only line removal), spts>0: savgol_filter smoothing (spts = 1: do nothing)
+            polyorder = 1                                       # Order 1 (linear) doesn't lead to cusps or NaNs
+            if spts <= 0:
+                f_y = freqs_c
+                dif1 = np.concatenate(([0],np.diff(ylin)))       # will look for adjacent points unusually far apart in power
+                dif2 = np.concatenate((np.diff(ylin),[0]))       # these two vectors will allow us to remove both of the points efficiently
+                mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
+                mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+                mask = mask1 & mask2                                  # by 
+                f_y = f_y[mask]                                 # select only the well behaved data point frequencies
+                ys = ylin[mask]                                 # select only the well behaved data points
+                ylin = interp1(f_y, ys,k=1)(freqs_c)            # remake the spectrum with the correct frequencies
+            if np.abs(spts) > polyorder:                        # Smoothing (poly-fitting) needs at least 1 more data point than fit coeffs to actually be smoothing
+                # number points over which to smooth must be odd. Hence the 1+2*int(.../2) business
+                ylin = savgol_filter(ylin, \
+                    1+2*int(np.min([np.abs(spts),np.shape(freqs_c)[0]/10])/2),polyorder) # smooth over no more than 1/10 the data at a time                
+            # Whiten the background for hydrogen observations (better to do this in "showdata.py" if data is being saved)
+            if args.whiten:
+                mask = ~((freqs_c > 1419.7*1e6) & (freqs_c < 1420.9*1e6))
+                norder = 10
+                fr = freqs_c/1e6 - np.median(freqs_c/1e6)
+                c = np.polyfit(fr[mask],ylin[mask],norder)
+                bkgr = np.polyval(c,fr)
+                ylin=ylin/bkgr
+
+            ax.set_ylabel('Days since MJD '+'{:.4f}'.format(t[0].jd-2400000.5))
+        else:
+            extent =[freqs[0]/1e6, freqs[-1]/1e6, 0, (t[-1]-t[0]).jd*24]
+            ax.set_ylabel('Hours since UTC:  '+ t[0].iso)          
+        ax.set_xlabel('MHz')
+        try:
+            im=ax.imshow(data[::-1,:],extent=extent,aspect='auto',cmap=colmap)
+        except:
+            im=ax.imshow(data[::-1,:],extent=extent,aspect='auto')
+
+        datamedian = np.median(data[~np.isnan(data)])
+        datastd = np.std(data[~np.isnan(data)])
+        defaultmin = datamedian-1.5*datastd                 # set the default color limits
+        defaultmax = datamedian+1.5*datastd                 # works best for fairly white data
+        im.set_clim(defaultmin,defaultmax)
+        cbaxes = fig.add_axes([0.9, 0.15, 0.015, 0.77])     # axes for the colorbar
+        cbar = plt.colorbar(im, cax=cbaxes)                 # make the colorbar on cbaxes
+        plt.subplots_adjust(left=0.1, right=0.87, bottom=0.15, top=0.92)
+
+        # make axes for and add the sliders and their callback function
+        cmin_ax = plt.axes([0.16,0.02,0.675,0.015], facecolor='black')
+        cmax_ax = plt.axes([0.16,0.05,0.675,0.015], facecolor='black')
+        cminmin = cmaxmin = np.max([np.min([np.min(data[~np.isnan(data)]),defaultmin]),-120])
+        cminmax = cmaxmax = np.min([np.max([np.max(data[~np.isnan(data)]),defaultmax]),120])
+        sliderfgcolor = [0.48,0.45,0.45]
+        scmin = Slider(cmin_ax, 'cmin', cminmin , cminmax , valinit=defaultmin,color=sliderfgcolor)
+        scmax = Slider(cmax_ax, 'cmax', cmaxmin , cmaxmax , valinit=defaultmax,color=sliderfgcolor)
+        def updatecvalues(placeholderval):
+            im.set_clim(scmin.val,scmax.val)
+            cbar.set_clim(vmin=scmin.val,vmax=scmax.val)
+        scmin.on_changed(updatecvalues)
+        scmax.on_changed(updatecvalues)
+
+def main():
+    if os.path.isdir(inputfile):
+        slider = False
+        for filename in os.listdir(inputfile):
+            if filename.endswith(".txt"):
+                try:
+                    makeplot(inputfile + filename,pcolorplot)
+                except:
+                    print('Could not plot data in: ' + filename)
+        plt.show()
+    else:
+        makeplot(inputfile,pcolorplot)
+        plt.show(block=True)
+    print('Done')
+    print(' ')
+
+if __name__ == '__main__':
+    main()
+
+    # The following code is to make a series of plots3d showing all the spectra.
+    # It was superceded by the slider version but could be useful sometime later.
+    #elif lines3d:
+    #     ax = fig.add_subplot(111,projection='3d')
+    #     axcolor3d = (0.2, 0.2, 0.1, 0.5)
+    #     ax.w_xaxis.set_pane_color(axcolor3d)
+    #     ax.w_yaxis.set_pane_color(axcolor3d)
+    #     ax.w_zaxis.set_pane_color(axcolor3d)        
+    #     r = range(0,np.shape(t)[0],pskip)
+    #     for s in r:#[-1::-1]:
+    #         x = freqs/1e6
+    #         y = np.ones(np.shape(freqs))*(t[s]-t[0])
+    #         z = data[s,:]
+    #         mask = (x > 1419) & (x < 1422)
+    #         try:
+    #             ax.scatter3D(x[mask],y[mask],z[mask],c=z[mask],cmap=colmap,s=2)
+    #         except:
+    #             ax.scatter3D(x[mask],y[mask],z[mask],c=z[mask],s=2)
+    #         ax.view_init(elev=33., azim=-66)
