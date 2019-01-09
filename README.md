@@ -1,4 +1,5 @@
-gnuradio reciver
+NOTE: At the moment most users will need to downgrade matplotlib to version 2.02 in order
+to use this program.
 
  Implements a "spectrometer" using a Sofware Defined Receiver (SDR). It can receive
 from any receiver supported by gnuradio via the --args argument although support 
@@ -13,7 +14,11 @@ smoothing of the spectrum acquired by low order polynomial fits over several adj
 points. Choice of averaging method.
 
 Tested on Ubuntu 16.04, 18.04 and MacOS. User should have installed: python 2.7, 
-gnuradio, astropy, uhd, astropy, matplotlib==2.02 .
+gnuradio, astropy, uhd, astropy, matplotlib==2.02. To install this specific version of
+matplotlib, use: sudo pip install matplotlib==2.02).
+The latest release of matplotlib appears to have an unresolved bug affecting MacOS 
+and a dependency issue on Ubuntu where the correct version of functools_lru_cache 
+can't be found.
 
 Credits: 
 1. Initial version (data acquisiion, spectrum generation, zmq-based data handling, and 
