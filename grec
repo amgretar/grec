@@ -74,7 +74,15 @@ portnum = 5555              # communication with receiver. Use different ports f
 figtitle = 'Spectrum'       # default figure title
 nreads = 75                 # number of raw spectra to averge before sending to the zmq push sink (port)
 
-CSI = '\x1B['               # Used to make terminal text to colored. See Wikipedia, "ANSI escape codes" (ex: print(CSI+'94m'+'Andri'+CSI +'0m') )
+# terminal colors are acheived with "ANSI escape codes" (See Wikipedia), ex: print(CSI+'94m'+'Andri'+CSI +'0m')
+CSI = '\x1B['               # escape
+#info = CSI+'37;1m'          # escape + color code (bright white)
+info = CSI+'32;1m'          # escape + color code (bright green)
+emph = CSI+'35;1m'          # escape + color code (bright magenta)
+#lowpriority = CSI +'94;1m' # escape + color code (bright blue)
+lowpriority = CSI +'37m'    # escape + color code (white)
+reset = CSI + '0m'          # reset
+
 # ----------------------------------------------------------------------------------------------------------------
 # PARSE PARAMETERS PASSED FROM THE COMMAND LINE
 parser = argparse.ArgumentParser(description='Acquire spectra from an SDR. Example: spectrum_log.py -f 102 -r 2.5')
@@ -146,9 +154,9 @@ if do=='plot' or do=='both': doplot = True                      # controls wheth
 if do=='save' or do=='both': savedata = True                    # controls whether any data is saved
 
 FFT_size = round_to_nearest_2(FFT_size)                         # forces FFT length to be a factor of 2 for speed
-print(CSI+'94m'+"FFT_size = "+str(FFT_size)+CSI +'0m')
+print(info+"FFT_size = "+str(FFT_size)+reset)
 freqs = (np.arange(FFT_size)-FFT_size/2)*SDR_BW/FFT_size + freq - upconv# generate frequency vector from center frequency, acq. rate, and FFT size
-print(CSI+'91m'+"freq range = " + str(freqs.min()/1e6)+','+str(freqs.max()/1e6)+CSI +'0m')
+print(info+"freq range = " + str(freqs.min()/1e6)+','+str(freqs.max()/1e6)+reset)
 
 nstart = int(np.floor(trimfrac*np.shape(freqs)[0]))
 nend = int(np.ceil((1-trimfrac)*np.shape(freqs)[0]))
@@ -166,9 +174,9 @@ if savedata:
     f.write("# Start Date: {d}\n".format(d=timestamp))
     f.write('# freqs: {freqs_c}\n'.format(freqs_c=','.join(freqs_c.astype(str))))
     f.write("# time (julian date), power in dB in each frequency bin\n")
-    print("logging to: {filename}".format(filename=filename))
+    print(info+"logging to: {filename}".format(filename=filename)+reset)
 else:
-    print("WARNING: data logging disabled")
+    print(emph + "WARNING: data logging disabled"+reset)
 
 def main(top_block_cls=spectrum,options=None):
     tb = top_block_cls(freq,FFT_size,SDR_BW,receiver_type,gain,portnum,extraargs)
@@ -247,7 +255,7 @@ def main(top_block_cls=spectrum,options=None):
             
             # Get data
             mean_accum = zmq_min_max_avg(socket_str,FFT_size,nreads=nreads) # data should be NchanxNtimes long where Ntimes floats around but is generally 2-6
-            print('.',end='')                
+            print(lowpriority+'.',end=''+reset)                
            
             # Divide by the no-antenna (noise) spectrum and trim band edges
             if yesbp:                                           # divide by spectrum without antenna attached (removes bandpass filter shape)
@@ -282,17 +290,17 @@ def main(top_block_cls=spectrum,options=None):
             # Average
             if i == 0:                                          # start running averages with a single spectrum
                 if avgtype == 'geom':
-                    print('Using exponentially weighted geometric  averaging')
+                    print(info+'Using exponentially weighted geometric  averaging'+reset)
                     sdB = dB(ylin)
                 elif avgtype == 'lin':
-                    print('Using exponentially weighted arithmetic averaging')
+                    print(info+'Using exponentially weighted arithmetic averaging'+reset)
                     slin = ylin
                 elif avgtype == 'median':
-                    print('Using median averaging')
+                    print(info+'Using median averaging'+reset)
                     ymat = np.array([ylin])
                     slin = ylin
                 else:
-                    print('Using unweighted arithmetic averaging')
+                    print(info+'Using unweighted arithmetic averaging'+reset)
                     slin = ylin
             else:
                 if avgtype == 'geom':
@@ -316,7 +324,7 @@ def main(top_block_cls=spectrum,options=None):
                     f.write(','.join(dB(slin).astype(str)))                   
                 f.write('\n')
                 tsaved = Time.now()
-                print('s',end='')
+                print(info+'s',end=''+reset)
 
             # Plot
             if doplot:
