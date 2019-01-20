@@ -115,7 +115,7 @@ parser.add_argument('-tf','--trimfrac',help='Fraction of frequencies to trim fro
 parser.add_argument('-ft','--figtitle',help='Figure title',type=str)
 parser.add_argument('-N','--nreads',help='Number of arithmetic averages to do before sending data to the logger for exponential averaging. Default: 300',type=int)
 parser.add_argument('-sp','--spts',help='Number of points over which to Savitzky-Golay filter (smooth) the data. (Only affects plot display, not data saved.) Negative values adds a line removal step. 1 = Do nothing, 0 = line removal only. Default: 1',type=int)
-parser.add_argument('-sv','--sval',help='Remove points that differ from the adjacent point by more than sval*median(diff(data)). Default: sval=2',type=float)
+parser.add_argument('-sv','--sval',help='Remove points that differ from the adjacent point by more than np.abs(sval)*median(diff(data)). Negative values of sval remove lines before and after averaging, otherwise line removal is only done before averaging. Default: sval=2',type=float)
 parser.add_argument('-wh','--whiten', help='Use with hydrogen observations to whiten the background (in plot display only)',type=int)
 parser.add_argument('-v','--velax', help='Plot frequency axis in terms of doppler velocities of hydrogen',action='store_true')
 parser.add_argument('-nc','--ncut',help='Number of points to remove from the center of the spectrum (DC peak). Default: 0',type=int)
@@ -244,8 +244,8 @@ if doplot:
     if spts <= 0:                                                   # remove other lines
         dif1 = np.concatenate(([0],np.diff(tmp)))                   # will look for adjacent points unusually far apart in power
         dif2 = np.concatenate((np.diff(tmp),[0]))                   # these two vectors will allow us to remove both of the points efficiently
-        mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) )       # construct a mask for data that does not vary too much from the spectrum
-        mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) )       # We remove both (adjacent) points having the large abs(diff) between them
+        mask1 = ( np.abs(dif1)<np.abs(sval)*np.median(np.abs(dif1)) )       # construct a mask for data that does not vary too much from the spectrum
+        mask2 = ( np.abs(dif2)<np.abs(sval)*np.median(np.abs(dif2)) )       # We remove both (adjacent) points having the large abs(diff) between them
         mask = mask1 & mask2                                        # select only the well behaved data points
         tmp = interp1(freqs_c[mask], tmp[mask],k=1)(freqs_c)        # remake the spectrum with the correct frequencies
     if yesbp: tmp = tmp-dB(bandpass[nstart:nend])                                # correct for the no-antenna background spectrum
@@ -321,8 +321,8 @@ while duration > (Time.now()-tstart).sec:
         if spts <= 0:
             dif1 = np.concatenate(([0],np.diff(ylin)))       # will look for adjacent points unusually far apart in power
             dif2 = np.concatenate((np.diff(ylin),[0]))       # these two vectors will allow us to remove both of the points efficiently
-            mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
-            mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+            mask1 = ( np.abs(dif1)<np.abs(sval)*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
+            mask2 = ( np.abs(dif2)<np.abs(sval)*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
             mask = mask1 & mask2                                  # by 
             ydisp = ylin[mask]                                 # select only the well behaved data points
             ylin = interp1(freqs_c[mask], ydisp,k=1)(freqs_c)            # remake the spectrum with the correct frequencies
@@ -353,6 +353,7 @@ while duration > (Time.now()-tstart).sec:
             else:
                 print(info+'Using unweighted arithmetic averaging'+reset)
                 slin = ylin
+            
         else:
             if avgtype == 'geom':
                 sdB = alpha*dB(ylin) + (1-alpha)*sdB        # exponentially weighted _geometric_ mean (mean dB's per Hz)
@@ -365,7 +366,25 @@ while duration > (Time.now()-tstart).sec:
                 slin = np.median(ymat,axis=0)               # median is taken column by column
             else:                                           # running arithmetic average
                 slin = slin + (ylin-slin)/cnt               # add an nth of the latest sample and subtract an nth of the mean
-            
+        
+        if avgtype == 'geom' and spts <= 0 and sval <= 0:
+            dif1 = np.concatenate(([0],np.diff(10**(sdB/10))))       # will look for adjacent points unusually far apart in power
+            dif2 = np.concatenate((np.diff(10**(sdB/10)),[0]))       # these two vectors will allow us to remove both of the points efficiently
+            mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
+            mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+            mask = mask1 & mask2                                  # by 
+            sdispdB = sdB[mask]                                 # select only the well behaved data points
+            sdB = dB(interp1(freqs_c[mask], sdispdB,k=1)(freqs_c))          # remake the spectrum with the correct frequencies
+        elif spts <=0 and sval <= 0:
+            dif1 = np.concatenate(([0],np.diff(slin)))       # will look for adjacent points unusually far apart in power
+            dif2 = np.concatenate((np.diff(slin),[0]))       # these two vectors will allow us to remove both of the points efficiently
+            mask1 = ( np.abs(dif1)<np.abs(sval)*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
+            mask2 = ( np.abs(dif2)<np.abs(sval)*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+            mask = mask1 & mask2                                  # by 
+            sdisp = slin[mask]                                 # select only the well behaved data points
+            slin = interp1(freqs_c[mask], sdisp,k=1)(freqs_c)            # remake the spectrum with the correct frequencies
+
+
         # Write
         if (Time.now()-tsaved).sec >= dtsave and savedata:  # writes a .csv file with time in the first column, spectrum values in subsequent ones
             f.write(str(t.jd)+', ')
