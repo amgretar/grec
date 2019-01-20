@@ -2,18 +2,22 @@
 
 # Implements a "spectrometer" using a Sofware Defined Receiver (SDR). It can receive
 # from any receiver supported by gnuradio via the --args argument although support for
-# rtl, airspy, uhd, & funcube receivers is slightly more streamlined. The program spectrum_log.py 
-# is the front end to the actual data acquisition program spectrum.py. The program has as
-# a companion program, showdata.py which is made to display the data format (text array)
+# rtl, airspy, uhd, & funcube receivers is slightly more streamlined. This program "grec" 
+# is the front end to the actual data acquisition program spectrum.py. This program has as
+# a companion program, "showdata" which is made to display the data format (text array)
 # used to store the acquired spectra. 
 # 
 # Features: optional background subtraction (using a 
-# background spectrum measured previously), optional line removal/reduction, optional 
-# smoothing of the spectrum acquired by low order polynomial fits over several adjacent
-# points. Choice of averaging method.
+# background spectrum measured previously), optional line removal/reduction, whitening of
+# the background, and optional smoothing of the spectrum acquired by "low order"
+# polynomial fits over several adjacent points. (The data written to disk does NOT include
+# the line removal or whitening, only averaging.) Choice given between several different
+# averaging methods.
 #
 # todo: 
-# - test integration with Vigilants
+# - add flag to generate secondary plot showing bandpass subtraction and background 
+#   fit for the whitening process 
+# - allow binary data type (".fits"?)
 #
 # Credits: 
 # - Initial version (data acquisiion, spectrum generation, zmq-based data handling, and 
@@ -51,7 +55,8 @@ filestring = 'test'         # add this name to the filename string to help ident
 receiver_type = 'osmo'      # rtl, airspy, uhd, osmo, funcube. Use "uhd" if bandpass bandwidth must be set, such as for B200. Can also use rtl, uhd, airspy etc to differentiate between multiple dissimilar receivers connected to a single machine
 datadir = 'data/'           # directory into which to write the data 
 SDR_BW = 2.5                # sample rate of the receiver
-gain = 50
+gain = 50                   # receiver gain setting
+dBoffset = 0                # number of dB's to add to the default y-scale for calibration purposes
 FFT_size = 4096             # Number of bins in the FFT
 duration = 15               # duration of measurement in seconds
 dtsave = 10                 # interval between data saves
@@ -68,12 +73,13 @@ sval = 2                    # line removal aggressiveness. Also see description 
 bp_file = 'none'            # default file is for an rtlsdr v1 with a yellow/orange circuit board
 bp_bw = SDR_BW              # freqeuncy range of the bandpass data in bp_file
 extraargs = ''              # additional arguments to send to the receiver
-ymin = -20                  # minimum y-axis value (dB)
-ymax = 50                   # maximum y-axis value (dB)
+ymin = -10                  # minimum y-axis value (dB)
+ymax = 10                   # maximum y-axis value (dB)
 portnum = 5555              # communication with receiver. Use different ports for multiple receivers on the same machine.
 figtitle = 'Spectrum'       # default figure title
 nreads = 75                 # number of raw spectra to averge before sending to the zmq push sink (port)
-
+ncut = 0                    # number of spectrum points to remove from the center of the spectrum (interpolate to fill in removed points)
+whiten = 0                  # if set to greater than zero then a polynomial of that order is used to whiten the background
 # terminal colors are acheived with "ANSI escape codes" (See Wikipedia), ex: print(CSI+'94m'+'Andri'+CSI +'0m')
 CSI = '\x1B['               # escape
 #info = CSI+'37;1m'          # escape + color code (bright white)
@@ -89,6 +95,7 @@ parser = argparse.ArgumentParser(description='Acquire spectra from an SDR. Examp
 parser.add_argument('-f','--frequency',help='Center frequency (in MHz) to which to tune. Default: 102.1 ',type=float)
 parser.add_argument('-r','--samplerate',help='Number of I,Q demod pairs to be acquired per second (in millions). Default: 3.2',type=float)
 parser.add_argument('-g','--gain',help='LNA gain (0-50 dB)',type=float)
+parser.add_argument('-dBo','--dBoffset',help='Decibels to add to scale (calibration). Default: 0',type=float)
 parser.add_argument('-o','--outdir',help='Path to directory for holding output data file. Default: ''./data/''',type=str)
 parser.add_argument('-s','--filestring',help='String to add to the output data file name',type=str)
 parser.add_argument('-fn','--filename',help='Give an explicit file name for the output data. Default: none', type=str)
@@ -101,17 +108,20 @@ parser.add_argument('-ymin','--ymin',help='Lower range of plot (dB)',type=float)
 parser.add_argument('-ymax','--ymax',help='Upper range of plot (dB)',type=float)
 parser.add_argument('-tc','--avgtime',help='Averaging time constant (sec)',type=float)
 parser.add_argument('-av','--avgtype',help='Type of average ''geom''(etric) or ''lin''(ear)',type=str)
-parser.add_argument('-dts','--dtsave',help='Time between saves of the spectrum',type=float)
-parser.add_argument('-do','--do',help='What the code should output: ''save'', ''plot'', or ''both''',type=str)
+parser.add_argument('-dts','--dtsave',help='Time between saves of the spectrum in seconds',type=float)
+parser.add_argument('-do','--do',help='What the code should output: ''save'', ''plot'', or ''both''. Default is ''plot.''',type=str)
 parser.add_argument('-kp','--kp',help='''True'' to keep plot (and python) open at the end of acquisition. Default: ''False''',type=str)
 parser.add_argument('-tf','--trimfrac',help='Fraction of frequencies to trim from each end. Default: 0.05',type=float)
 parser.add_argument('-ft','--figtitle',help='Figure title',type=str)
 parser.add_argument('-N','--nreads',help='Number of arithmetic averages to do before sending data to the logger for exponential averaging. Default: 300',type=int)
-parser.add_argument('-sp','--spts',help='Number of points over which to Savitzky-Golay filter (smooth) the data. Negative values adds a line removal step. 1 = Do nothing, 0 = line removal only. Default: 1',type=int)
+parser.add_argument('-sp','--spts',help='Number of points over which to Savitzky-Golay filter (smooth) the data. (Only affects plot display, not data saved.) Negative values adds a line removal step. 1 = Do nothing, 0 = line removal only. Default: 1',type=int)
 parser.add_argument('-sv','--sval',help='Remove points that differ from the adjacent point by more than sval*median(diff(data)). Default: sval=2',type=float)
-parser.add_argument('-wh','--whiten', help='Use with hydrogen observations to whiten the background',action='store_true')
+parser.add_argument('-wh','--whiten', help='Use with hydrogen observations to whiten the background (in plot display only)',type=int)
+parser.add_argument('-v','--velax', help='Plot frequency axis in terms of doppler velocities of hydrogen',action='store_true')
+parser.add_argument('-nc','--ncut',help='Number of points to remove from the center of the spectrum (DC peak). Default: 0',type=int)
 parser.add_argument('-lo','--upconv',help='Upconverter local oscillator frequency (MHz)',type=float)
 parser.add_argument('-pn','--portnum',help='Port number for communication. Default: 5555)',type=int)
+#parser.add_argument('-det','--details',help='Show additional details, including plot with bandpass, whitening, etc.',action='store_true')
 parser.add_argument('-a','--args',help='Additional arguments to send to receiver, e.g. subdev=B:0 or bias=1',type=str)
 parser.add_argument('--version',action='version',version='spectrum_log 1.0')
 args = parser.parse_args()
@@ -119,6 +129,7 @@ args = parser.parse_args()
 if args.frequency is not None: freq = args.frequency
 if args.samplerate is not None: SDR_BW = args.samplerate
 if args.gain is not None: gain = args.gain
+if args.dBoffset is not None: dBoffset = args.dBoffset
 if args.outdir is not None: datadir = args.outdir
 if args.filestring is not None: filestring = args.filestring
 if args.duration is not None: duration = args.duration
@@ -138,6 +149,8 @@ if args.trimfrac is not None: trimfrac = args.trimfrac
 if args.nreads is not None: nreads = args.nreads
 if args.spts is not None: spts = args.spts
 if args.sval is not None: sval = args.sval
+if args.ncut is not None: ncut = args.ncut
+if args.whiten is not None: whiten = args.whiten
 if args.upconv is not None: upconv = args.upconv
 if args.portnum is not None: portnum = args.portnum
 if args.args is not None: extraargs = ',' + args.args
@@ -158,9 +171,11 @@ print(info+"FFT_size = "+str(FFT_size)+reset)
 freqs = (np.arange(FFT_size)-FFT_size/2)*SDR_BW/FFT_size + freq - upconv# generate frequency vector from center frequency, acq. rate, and FFT size
 print(info+"freq range = " + str(freqs.min()/1e6)+','+str(freqs.max()/1e6)+reset)
 
-nstart = int(np.floor(trimfrac*np.shape(freqs)[0]))
+nstart = int(np.floor(trimfrac*np.shape(freqs)[0]))             # will be used to trim the data edges
 nend = int(np.ceil((1-trimfrac)*np.shape(freqs)[0]))
-freqs_c = freqs[nstart:nend]  
+freqs_c = freqs[nstart:nend]
+vel = (1420.406-freqs_c/1e6)/1420.406*300000.0                  # Doppler shift velocity km/s
+
 
 # start a data file
 if savedata:
@@ -174,55 +189,82 @@ if savedata:
     f.write("# Start Date: {d}\n".format(d=timestamp))
     f.write('# freqs: {freqs_c}\n'.format(freqs_c=','.join(freqs_c.astype(str))))
     f.write("# time (julian date), power in dB in each frequency bin\n")
-    print(info+"logging to: {filename}".format(filename=filename)+reset)
+    print(info+"Saving to: {filename}".format(filename=filename)+reset)
 else:
-    print(emph + "WARNING: data logging disabled"+reset)
+    print(emph + "Data logging disabled."+reset)
 
-def main(top_block_cls=spectrum,options=None):
-    tb = top_block_cls(freq,FFT_size,SDR_BW,receiver_type,gain,portnum,extraargs)
-    socket_str = tb.get_data_address()                          # data are streaming from this ZMQ push sink
-    tb.set_tuning(freq)
-    tb.set_gain(gain)  
+#def main(top_block_cls=spectrum,options=None):
+#tb = top_block_cls(freq,FFT_size,SDR_BW,receiver_type,gain,portnum,extraargs)
+tb = spectrum(freq,FFT_size,SDR_BW,receiver_type,gain,portnum,extraargs)
+socket_str = tb.get_data_address()                          # data are streaming from this ZMQ push sink
+tb.set_tuning(freq)
+tb.set_gain(gain)  
 
-    # load bandpass data
-    try:
-        try:                                                    # this section applies when bp_file contains a single column-vector or row-vector (text)
-            bpdata = np.loadtxt(bp_file)                        # assumed to be uniformly spaced in frequency
-            bpr = 10**(bpdata/10)
-            f_bp = np.linspace(freq-bp_bw/2,freq+bp_bw/2,np.shape(bpr)[0])
-            bandpass = interp1(f_bp,bpr,k=3)(freqs)
-            yesbp = True
-            # plt.plot(freqs, bandpass)
-            # plt.show()            
-        except:                                                 # this section applies to data files of the type output by this program
-            bpdata = np.loadtxt(bp_file,  delimiter=',', skiprows=4) 
-            bpdata = bpdata[:,1:]                               # first column is the julian date; remove
-            bpr = np.mean(10**(bpdata/10),0)                    # average the rows in case there were many spectra written
-            dif = np.concatenate(([0],np.diff(bpr)))            # look for spurious lines from the receiver
-            f_bp = np.linspace(freq-bp_bw/2,freq+bp_bw/2,np.shape(bpr)[0])
-            mask = np.abs(dif)<3*np.median(np.abs(dif))         # construct a mask for data that does not vary too much from the spectrum
-            f_bp = f_bp[mask]                                   # select only the well behaved data point frequencies
-            bpr = bpr[mask]                                     # select only the well behaved data points
-            bpr= savgol_filter(bpr, int(np.floor(FFT_size/100)*2+1), 3) # smooth the bandpass data
-            bandpass = interp1(f_bp, bpr,k=3)(freqs)            # make the bandpass spectrum with the correct frequencies
-            yesbp = True
-            # plt.plot(freqs, bandpass)
-            # plt.show()
-    except:
-        yesbp = False
+# load bandpass data
+try:
+    try:                                                    # this section applies when bp_file contains a single column-vector or row-vector (text)
+        bpdata = np.loadtxt(bp_file)                        # assumed to be uniformly spaced in frequency
+        bpr = 10**(bpdata/10)
+        f_bp = np.linspace(freq-bp_bw/2,freq+bp_bw/2,np.shape(bpr)[0])
+        bandpass = interp1(f_bp,bpr,k=3)(freqs)
+        yesbp = True        
+    except:                                                 # this section applies to data files of the type output by this program
+        bpdata = np.loadtxt(bp_file,  delimiter=',', skiprows=4) 
+        bpdata = bpdata[:,1:]                               # first column is the julian date; remove
+        bpr = np.mean(10**(bpdata/10),0)                    # average the rows in case there were many spectra written
+        dif = np.concatenate(([0],np.diff(bpr)))            # look for spurious lines from the receiver
+        f_bp = np.linspace(freq-bp_bw/2,freq+bp_bw/2,np.shape(bpr)[0])
+        mask = np.abs(dif)<3*np.median(np.abs(dif))         # construct a mask for data that does not vary too much from the spectrum
+        f_bp = f_bp[mask]                                   # select only the well behaved data point frequencies
+        bpr = bpr[mask]                                     # select only the well behaved data points
+        bpr= savgol_filter(bpr, int(np.floor(FFT_size/100)*2+1), 3) # smooth the bandpass data
+        bandpass = interp1(f_bp, bpr,k=3)(freqs)            # make the bandpass spectrum with the correct frequencies
+        yesbp = True
+        # plt.plot(freqs, bandpass)
+        # plt.show()
+except:
+    yesbp = False
 
-    # set up plot: interactive figure with nice aethetics. After this, data just gets replaced.
-    if doplot:
-        plt.ion()
-        plotstyle.use('dark_background')
-        fig = plt.figure(figsize=(12,12/1.618))              
-        ax = fig.add_subplot(111)
-        y =np.linspace(ymin,ymax,np.shape(freqs_c)[0])   # fill the axes with a line from corner to corner to establish the plot canvas
-        p,=ax.plot(freqs_c/1e6,y,c='k',alpha=0.6,linewidth=0.5)
-        plt.xlabel('freq [MHz]')
+tb.start()                                                  # start the receiver  (top block)
+# set up plot: interactive figure with nice aethetics. After this, data just gets replaced.
+if doplot:
+    plt.ion()
+    plotstyle.use('dark_background')
+    fig = plt.figure(figsize=(12,12/1.618))              
+    ax = fig.add_subplot(111)
+    tmp = dB(zmq_min_max_avg(socket_str,FFT_size,nreads=10)) + dBoffset     # sample spectrum to set range of plot
+    if ncut!=0:                                                     # cut the center "spike" out
+        cpos = int(np.floor(np.size(freqs)/2))            # find the center point (immediately left of center for even number of points)
+        ncutleft = int(np.ceil(ncut/2))
+        ncutright = int(np.floor(ncut/2))
+        tmp_cut = np.concatenate([tmp[0:cpos-ncutleft],tmp[cpos+ncutright:]])
+        freqs_cut = np.concatenate([freqs[0:cpos-ncutleft], freqs[cpos+ncutright:]])
+        tmp = interp1(freqs_cut, tmp_cut,k=1)(freqs)
+    tmp = tmp[nstart:nend]
+    if spts <= 0:                                                   # remove other lines
+        dif1 = np.concatenate(([0],np.diff(tmp)))                   # will look for adjacent points unusually far apart in power
+        dif2 = np.concatenate((np.diff(tmp),[0]))                   # these two vectors will allow us to remove both of the points efficiently
+        mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) )       # construct a mask for data that does not vary too much from the spectrum
+        mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) )       # We remove both (adjacent) points having the large abs(diff) between them
+        mask = mask1 & mask2                                        # select only the well behaved data points
+        tmp = interp1(freqs_c[mask], tmp[mask],k=1)(freqs_c)        # remake the spectrum with the correct frequencies
+    if yesbp: tmp = tmp-dB(bandpass[nstart:nend])                                # correct for the no-antenna background spectrum
+    if whiten==0:                                                   # whitened spectra must have their y-limits set by hand
+        yminimum = np.min(tmp)                                      # temporary variable
+        ymaximum = np.max(tmp)                                             
+        yrange = ymaximum - yminimum
+        if args.ymin is None: ymin = yminimum - 0.05*yrange         # if ymin isn't given explicitly get it from a sample spectrum 
+        if args.ymax is None: ymax = ymaximum + 0.25*yrange         # ad add a bit of space around the data max/min's
+    y =np.linspace(ymin,ymax,np.shape(freqs_c)[0])                  # fill the axes with a line from corner to corner to establish the plot canvas
+    if args.velax:                                                  # frequency axis -> doppler velocity axis for hydrogen
+        p,=ax.plot(vel,y,c='k',alpha=0.6,linewidth=0.5)
+        plt.xlabel('Line of site velocity (km/s)')
+    else:
+        p,=ax.plot(freqs_c/1e6,y,c='k',alpha=0.6,linewidth=0.5)     # Plot an invisible  diagonal line to set the plot size, this data gets replaced
+        plt.xlabel('Frequency (MHz)')
+    try:                                                            # prettify the plot
         plt.ylabel('dB')
         plt.title(figtitle)
-        plt.pause(0.001)
         plt.grid()
         p.set_color([0.9,0.9,1.0])
         fig.set_facecolor
@@ -238,116 +280,123 @@ def main(top_block_cls=spectrum,options=None):
         ax.xaxis.label.set_color(spinecolor)
         ax.yaxis.label.set_color(spinecolor)
         ax.title.set_color(spinecolor)
-    
-    i=0
-    tstart = Time.now()
-    t = tstart
-    tsaved = tstart
-    tb.start()
-    while duration > (Time.now()-tstart).sec:
-        try:
-            dt = Time.now().utc - t                             # time since last acquisision
-            t = Time.now().utc                                  # time of this acquisition
-            navg = np.round(np.max([avgtime/dt.sec,1]))         # at least 1 spectrum per average            # number of spectra, navg, in one averaging time, avgtime
-            cnt = np.min([navg,i+1])                            # partial average converges faster if we use cnt instead of navg
-            alpha = 1 - np.exp(-1/cnt)                          # smoothing factor "alpha" used below
-            #tb.start()                                         # gnuradio magic (activates the code in spectrum.py?)
+    except:
+        pass
+
+i=0
+tstart = Time.now()
+t = tstart
+tsaved = tstart
+while duration > (Time.now()-tstart).sec:
+    try:
+        dt = Time.now().utc - t                             # time since last acquisision
+        t = Time.now().utc                                  # time of this acquisition
+        navg = np.round(np.max([avgtime/dt.sec,1]))         # at least 1 spectrum per average            # number of spectra, navg, in one averaging time, avgtime
+        cnt = np.min([navg,i+1])                            # partial average converges faster if we use cnt instead of navg
+        alpha = 1 - np.exp(-1/cnt)                          # smoothing factor "alpha" used below
+        
+        # Get data
+        mean_accum = zmq_min_max_avg(socket_str,FFT_size,nreads=nreads) # data should be NchanxNtimes long where Ntimes floats around but is generally 2-6
+        mean_accum = mean_accum*10**(dBoffset/10)
+        print(lowpriority+'.',end=''+reset)                
+        
+        # Divide by the no-antenna (noise) spectrum and trim band edges
+        if yesbp:                                           # divide by spectrum without antenna attached (removes bandpass filter shape)
+            mean_accum = mean_accum/bandpass                # signal is now in units of receiver noise floor
+        
+        # Remove the DC peak in the center of the spectrum if requested (ncut ~= 0)
+        if ncut!=0:
+            cpos = int(np.floor(np.size(freqs)/2))            # find the center point (immediately left of center for even number of points)
+            ncutleft = int(np.ceil(ncut/2))
+            ncutright = int(np.floor(ncut/2))
+            mean_accum_cut = np.concatenate([mean_accum[0:cpos-ncutleft],mean_accum[cpos+ncutright:]])
+            freqs_cut = np.concatenate([freqs[0:cpos-ncutleft], freqs[cpos+ncutright:]])
+            mean_accum = interp1(freqs_cut, mean_accum_cut,k=1)(freqs)
             
-            # Get data
-            mean_accum = zmq_min_max_avg(socket_str,FFT_size,nreads=nreads) # data should be NchanxNtimes long where Ntimes floats around but is generally 2-6
-            print(lowpriority+'.',end=''+reset)                
-           
-            # Divide by the no-antenna (noise) spectrum and trim band edges
-            if yesbp:                                           # divide by spectrum without antenna attached (removes bandpass filter shape)
-                mean_accum = mean_accum/bandpass                # signal is now in units of receiver noise floor
-            ylin = mean_accum[nstart:nend]
+        # trim the data edges              
+        ylin = mean_accum[nstart:nend]
 
-            # Smoothing (spts<0: line removal and smoothing (spts=-1 or 0: only line removal), spts>0: savgol_filter smoothing (spts = 1: do nothing)
-            polyorder = 1                                       # Order 1 (linear) doesn't lead to cusps or NaNs
-            if spts <= 0:
-                f_y = freqs_c
-                dif1 = np.concatenate(([0],np.diff(ylin)))       # will look for adjacent points unusually far apart in power
-                dif2 = np.concatenate((np.diff(ylin),[0]))       # these two vectors will allow us to remove both of the points efficiently
-                mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
-                mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
-                mask = mask1 & mask2                                  # by 
-                f_y = f_y[mask]                                 # select only the well behaved data point frequencies
-                ys = ylin[mask]                                 # select only the well behaved data points
-                ylin = interp1(f_y, ys,k=1)(freqs_c)            # remake the spectrum with the correct frequencies
-            if np.abs(spts) > polyorder:                        # Smoothing (poly-fitting) needs at least 1 more data point than fit coeffs to actually be smoothing
-                # number points over which to smooth must be odd. Hence the 1+2*int(.../2) business
-                ylin = savgol_filter(ylin, \
-                    1+2*int(np.min([np.abs(spts),np.shape(freqs_c)[0]/10])/2),polyorder) # smooth over no more than 1/10 the data at a time                
-            # Whiten the background for hydrogen observations (better to do this in "showdata.py" if data is being saved)
-            if args.whiten:
-                mask = ~((freqs_c > 1419.7*1e6) & (freqs_c < 1420.9*1e6))
-                norder = 10
-                fr = freqs_c/1e6 - np.median(freqs_c/1e6)
-                c = np.polyfit(fr[mask],ylin[mask],norder)
-                bkgr = np.polyval(c,fr)
-                ylin=ylin/bkgr
+        # Smoothing (spts<0: line removal and smoothing (spts=-1 or 0: only line removal), spts>0: savgol_filter smoothing (spts = 1: do nothing)
+        polyorder = 1                                       # Order 1 (linear) doesn't lead to cusps or NaNs
+        if spts <= 0:
+            dif1 = np.concatenate(([0],np.diff(ylin)))       # will look for adjacent points unusually far apart in power
+            dif2 = np.concatenate((np.diff(ylin),[0]))       # these two vectors will allow us to remove both of the points efficiently
+            mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
+            mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+            mask = mask1 & mask2                                  # by 
+            ydisp = ylin[mask]                                 # select only the well behaved data points
+            ylin = interp1(freqs_c[mask], ydisp,k=1)(freqs_c)            # remake the spectrum with the correct frequencies
+        if np.abs(spts) > polyorder:                        # Smoothing (poly-fitting) needs at least 1 more data point than fit coeffs to actually be smoothing
+            # number points over which to smooth must be odd. Hence the 1+2*int(.../2) business
+            ylin = savgol_filter(ylin, \
+                1+2*int(np.min([np.abs(spts),np.shape(freqs_c)[0]/10])/2),polyorder) # smooth over no more than 1/10 the data at a time                
+        # Whiten the background for hydrogen observations (better to do this in "showdata.py" if data is being saved)
+        if whiten!=0:
+            mask = ~((freqs_c > 1419.7*1e6) & (freqs_c < 1420.9*1e6))
+            fr = freqs_c/1e6 - np.median(freqs_c/1e6)
+            c = np.polyfit(fr[mask],ylin[mask],whiten)
+            bkgr = np.polyval(c,fr)
+            ylin=ylin/bkgr
 
-            # Average
-            if i == 0:                                          # start running averages with a single spectrum
-                if avgtype == 'geom':
-                    print(info+'Using exponentially weighted geometric  averaging'+reset)
-                    sdB = dB(ylin)
-                elif avgtype == 'lin':
-                    print(info+'Using exponentially weighted arithmetic averaging'+reset)
-                    slin = ylin
-                elif avgtype == 'median':
-                    print(info+'Using median averaging'+reset)
-                    ymat = np.array([ylin])
-                    slin = ylin
-                else:
-                    print(info+'Using unweighted arithmetic averaging'+reset)
-                    slin = ylin
+        # Average
+        if i == 0:                                          # start running averages with a single spectrum
+            if avgtype == 'geom':
+                print(info+'Using exponentially weighted geometric  averaging'+reset)
+                sdB = dB(ylin)
+            elif avgtype == 'lin':
+                print(info+'Using exponentially weighted arithmetic averaging'+reset)
+                slin = ylin
+            elif avgtype == 'median':
+                print(info+'Using median averaging'+reset)
+                ymat = np.array([ylin])
+                slin = ylin
             else:
-                if avgtype == 'geom':
-                    sdB = alpha*dB(ylin) + (1-alpha)*sdB        # exponentially weighted _geometric_ mean (mean dB's per Hz)
-                elif avgtype == 'lin':
-                    slin = alpha*ylin + (1-alpha)*slin          # exponentially weighted _arithmetic_ mean (mean power per Hz) 
-                elif avgtype == 'median':                       # median averaging (good for intermittent noise but a bit memory hungry)
-                    if i >= navg:
-                        ymat = ymat[1:,:]                       # if matrix has reached navg rows. cut off first row before appending another
-                    ymat = np.append(ymat,np.array([ylin]),axis=0) # one spectrum per row in the matrix
-                    slin = np.median(ymat,axis=0)               # median is taken column by column
-                else:                                           # running arithmetic average
-                    slin = slin + (ylin-slin)/cnt               # add an nth of the latest sample and subtract an nth of the mean
-                
-            # Write
-            if (Time.now()-tsaved).sec >= dtsave and savedata:  # writes a .csv file with time in the first column, spectrum values in subsequent ones
-                f.write(str(t.jd)+', ')
-                if avgtype=='geom':
-                    f.write(','.join(sdB.astype(str)))
-                else:
-                    f.write(','.join(dB(slin).astype(str)))                   
-                f.write('\n')
-                tsaved = Time.now()
-                print(info+'s',end=''+reset)
-
-            # Plot
-            if doplot:
-                if avgtype=='geom':
-                    p.set_ydata(sdB)
-                else:
-                    sdB = dB(slin)
-                    p.set_ydata(sdB)         
-                fig.canvas.draw()
-                plt.pause(0.001)
-                
+                print(info+'Using unweighted arithmetic averaging'+reset)
+                slin = ylin
+        else:
+            if avgtype == 'geom':
+                sdB = alpha*dB(ylin) + (1-alpha)*sdB        # exponentially weighted _geometric_ mean (mean dB's per Hz)
+            elif avgtype == 'lin':
+                slin = alpha*ylin + (1-alpha)*slin          # exponentially weighted _arithmetic_ mean (mean power per Hz) 
+            elif avgtype == 'median':                       # median averaging (good for intermittent noise but a bit memory hungry)
+                if i >= navg:
+                    ymat = ymat[1:,:]                       # if matrix has reached navg rows. cut off first row before appending another
+                ymat = np.append(ymat,np.array([ylin]),axis=0) # one spectrum per row in the matrix
+                slin = np.median(ymat,axis=0)               # median is taken column by column
+            else:                                           # running arithmetic average
+                slin = slin + (ylin-slin)/cnt               # add an nth of the latest sample and subtract an nth of the mean
             
-            i += 1
-            sys.stdout.flush()
-        except(KeyboardInterrupt):
-            sys.exit()
-            
-        #tb.stop()                                                           # gnuradio magic (top_block is part of spectrum.py)
-        #tb.wait()                       
-    tb.stop()
-    tb.wait()
-    print('\n')
-    if kp: plt.show(block=True)
+        # Write
+        if (Time.now()-tsaved).sec >= dtsave and savedata:  # writes a .csv file with time in the first column, spectrum values in subsequent ones
+            f.write(str(t.jd)+', ')
+            if avgtype=='geom':
+                f.write(','.join(sdB.astype(str)))
+            else:
+                f.write(','.join(dB(slin).astype(str)))                   
+            f.write('\n')
+            tsaved = Time.now()
+            print(info+'s',end=''+reset)
 
-if __name__ == '__main__':
-    main()
+        # Plot
+        if doplot:
+            if avgtype=='geom':
+                p.set_ydata(sdB)
+            else:
+                sdB = dB(slin)
+                p.set_ydata(sdB)         
+            fig.canvas.draw()
+            plt.pause(0.001)
+            
+        
+        i += 1
+        sys.stdout.flush()
+    except(KeyboardInterrupt):
+        sys.exit()
+        
+tb.stop()
+tb.wait()
+print('\n')
+if kp: plt.show(block=True)
+
+# if __name__ == '__main__':
+#     main()

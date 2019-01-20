@@ -22,11 +22,13 @@ upconv = 0
 timetype = 'hrs'
 spts = 1                    # number of FFT points over which to smooth (Savitsky-Golay)
 sval = 2                    # line removal aggressiveness. Also see description in help.
+whiten = 10                 # default order for whitening polynomial fit to background
+interptype = 'none'         #bilinear'
 
 pcolorplot = True
 parser = argparse.ArgumentParser()
 parser.add_argument('-f','--fref',help='Frequency to use as a reference for gain drift correction (MHz)',type=float)
-parser.add_argument('-wh','--whiten',help='Attempt to whiten the background in the presence of hydrogen',action='store_true')
+parser.add_argument('-wh','--whiten',help='Attempt to whiten the background in the presence of hydrogen',type=int)
 parser.add_argument('-cm','--colmap',help='Any of the colormaps defimed inm matplotlib.cm',type=str)
 parser.add_argument('-sl','--slider',help='Display single spectrum at a time. Use slider to select time.',action='store_true')
 parser.add_argument('-lo','--upconv',help='Upconverter local oscillator frequency (MHz)',type=float)
@@ -34,6 +36,7 @@ parser.add_argument('-tt','--timetype',help='Set format for the time axis: ''day
 parser.add_argument('-wo','--writeout',help='Write the processed image to a text file as an array',action='store_true')
 parser.add_argument('-sp','--spts',help='Number of points over which to Savitzky-Golay filter (smooth) the data. Negative values adds a line removal step. 1 = Do nothing, 0 = line removal only. Default: 1',type=int)
 parser.add_argument('-sv','--sval',help='Remove points that differ from the adjacent point by more than sval*median(diff(data)). Default: sval=2',type=float)
+parser.add_argument('-i','--interp',help='display an interpolated spectrogram',action='store_true')
 parser.add_argument('inputfile',help='Path the the data file to plot. Default: data.txt',type=str)
 args = parser.parse_args()
 
@@ -44,6 +47,8 @@ if args.upconv != None: upconv = args.upconv
 if args.timetype != None: timetype = args.timetype
 if args.spts is not None: spts = args.spts
 if args.sval is not None: sval = args.sval
+if args.whiten is not None: whiten=args.whiten
+if args.interp == True: interptype='bilinear'
 
 def makeplot(filename,pcolorplot):
     # read the frequencies and parse them into freqs
@@ -76,6 +81,7 @@ def makeplot(filename,pcolorplot):
     # Smoothing (spts<0: line removal and smoothing (spts=-1 or 0: only line removal), spts>0: savgol_filter smoothing (spts = 1: do nothing)
     polyorder = 1                                       # Order 1 (linear) doesn't lead to cusps or NaNs
     if args.spts is not None:
+        print('Removing lines and/or Savgol filter smoothing')
         for s in range(0,np.shape(t)[0]):
             ylin = 10**(data[s,:]/10)
             if spts <= 0:
@@ -96,9 +102,8 @@ def makeplot(filename,pcolorplot):
         mask = ~((freqs > 1419.7*1e6) & (freqs < 1420.9*1e6))
         for s in range(0,np.shape(t)[0]):
             d = data[s,:]
-            norder = 15
             fr = freqs/1e6 - np.median(freqs/1e6)
-            c = np.polyfit(fr[mask],d[mask],norder)
+            c = np.polyfit(fr[mask],d[mask],whiten)
             bkgr = np.polyval(c,fr)
             data[s,:]=data[s,:]-bkgr
 
@@ -199,9 +204,9 @@ def makeplot(filename,pcolorplot):
             ax.set_ylabel('Hours since UTC:  '+ t[0].iso)          
         ax.set_xlabel('MHz')
         try:
-            im=ax.imshow(data[::-1,:],extent=extent,aspect='auto',cmap=colmap)
+            im=ax.imshow(data[::-1,:],extent=extent,aspect='auto',cmap=colmap,interpolation = interptype)
         except:
-            im=ax.imshow(data[::-1,:],extent=extent,aspect='auto')
+            im=ax.imshow(data[::-1,:],extent=extent,aspect='auto',interpolation = interptype)
 
         datamedian = np.median(data[~np.isnan(data)])
         datastd = np.std(data[~np.isnan(data)])
