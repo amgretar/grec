@@ -370,11 +370,11 @@ while duration > (Time.now()-tstart).sec:
         if avgtype == 'geom' and spts <= 0 and sval <= 0:
             dif1 = np.concatenate(([0],np.diff(10**(sdB/10))))       # will look for adjacent points unusually far apart in power
             dif2 = np.concatenate((np.diff(10**(sdB/10)),[0]))       # these two vectors will allow us to remove both of the points efficiently
-            mask1 = ( np.abs(dif1)<sval*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
-            mask2 = ( np.abs(dif2)<sval*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
+            mask1 = ( np.abs(dif1)<np.abs(sval)*np.median(np.abs(dif1)) ) # construct a mask for data that does not vary too much from the spectrum
+            mask2 = ( np.abs(dif2)<np.abs(sval)*np.median(np.abs(dif2)) ) # We remove both (adjacent) points having the large abs(diff) between them
             mask = mask1 & mask2                                  # by 
             sdispdB = sdB[mask]                                 # select only the well behaved data points
-            sdB = dB(interp1(freqs_c[mask], sdispdB,k=1)(freqs_c))          # remake the spectrum with the correct frequencies
+            sdB = dB(interp1(freqs_c[mask], 10**(sdispdB/10),k=1)(freqs_c))          # remake the spectrum with the correct frequencies
         elif spts <=0 and sval <= 0:
             dif1 = np.concatenate(([0],np.diff(slin)))       # will look for adjacent points unusually far apart in power
             dif2 = np.concatenate((np.diff(slin),[0]))       # these two vectors will allow us to remove both of the points efficiently
